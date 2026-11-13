@@ -167,6 +167,9 @@ from tensorrt_llm._torch.modeling_v2.catalog.comm.allreduce import allreduce, al
 from tensorrt_llm._torch.modeling_v2.catalog.comm.reducescatter import reducescatter
 from tensorrt_llm._torch.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
 from tensorrt_llm._torch.modeling_v2.catalog.graph.eager_on_graph import eager_on_graph
+from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import (
+    eager_on_graph as _engine_eager_on_graph,
+)
 from tensorrt_llm._torch.modeling_v2.catalog.moe.fp4_block_scale_moe_runner import (
     MAX_CERTIFIED_TOKENS as _MOE_MAX_ROWS,
 )
@@ -3769,6 +3772,13 @@ class _KvRangeProbe:
 # The split the executor's warmup runs for a dummy request (`_warm_inforward_split`) reports
 # as `[inforward-validate] [warmup] ...`, so a line without `[warmup]` is a served request's.
 _INFORWARD_VALIDATE = os.environ.get("TRTLLM_QWEN4_EXP_INFORWARD_VALIDATE", "0") == "1"
+# TRTLLM_QWEN4_EXP_GDN_BREAK_GRAPH=1: under a breakable prefill CUDA graph the Gated-DeltaNet
+# break of a context-only step replays as a CUDA graph of its own (the engine's graphed
+# breaks, `eager_on_graph(graph_key=, graph_body=)`, as the stock GDN mixer does) instead
+# of launching its kernels from Python on every step. One graph per layer and key: the
+# request count, the in-forward split's shape and the addresses of the metadata and state
+# buffers it reads. The body runs the recurrence over all `T` padded rows. Default off.
+_GDN_BREAK_GRAPH = os.environ.get("TRTLLM_QWEN4_EXP_GDN_BREAK_GRAPH", "0") == "1"
 _inforward_validate_reports = 0
 _inforward_validate_warmup = False
 
@@ -3835,8 +3845,25 @@ class _InforwardSplit(NamedTuple):
     stage_idx: torch.Tensor
 
 
-def _inforward_split(md, mm, si_all, hi_all, pools) -> _InforwardSplit | None:
-    """This step's in-forward snapshot split, or None on a step without one."""
+def _stable(store: dict | None, name: str, value: torch.Tensor) -> torch.Tensor:
+    """`value` in a buffer that keeps its address across steps (a graphed break reads its
+    operands by address): a prefix view of `store[name]`, refilled in place. A buffer too
+    small is replaced, which changes the address and so the break's graph key."""
+    if store is None:
+        return value
+    buf = store.get(name)
+    n = value.shape[0]
+    if buf is None or buf.shape[0] < n or buf.dtype != value.dtype:
+        buf = torch.zeros(max(n, 1024), dtype=value.dtype, device=value.device)
+        store[name] = buf
+    view = buf[:n]
+    view.copy_(value)
+    return view
+
+
+def _inforward_split(md, mm, si_all, hi_all, pools, store: dict | None = None) -> _InforwardSplit | None:
+    """This step's in-forward snapshot split, or None on a step without one. With `store`
+    its per-step vectors live in buffers of fixed address (`_stable`)."""
     split = getattr(mm, "inforward_split", None)
     if split is None:
         return None
@@ -3848,6 +3875,7 @@ def _inforward_split(md, mm, si_all, hi_all, pools) -> _InforwardSplit | None:
     )
     carried = torch.zeros(split.gather.shape[0], dtype=hi_all.dtype, device=hi_all.device)
     carried.index_copy_(0, split.main_rows, hi_all[: md.num_contexts])
+    carried = _stable(store, "carried", carried)
     # The first packed row of each planned request's tail: its snapshot point P.
     points = split.cu.index_select(0, split.split_rows + 1)
 
@@ -3858,12 +3886,12 @@ def _inforward_split(md, mm, si_all, hi_all, pools) -> _InforwardSplit | None:
     ple_conv, ple_ngram = pools.ple_state
     return _InforwardSplit(
         split=split,
-        gather=split.gather.to(si_all.dtype),
+        gather=_stable(store, "gather", split.gather.to(si_all.dtype)),
         carried=carried,
-        live=split.live.to(si_all.dtype),
+        live=_stable(store, "live", split.live.to(si_all.dtype)),
         ple_conv_win=window(ple_conv.shape[-1]),
         ple_ngram_win=window(ple_ngram.shape[-1]),
-        stage_idx=split.stage_rows.to(si_all.dtype),
+        stage_idx=_stable(store, "stage_idx", split.stage_rows.to(si_all.dtype)),
     )
 
 
@@ -3918,6 +3946,12 @@ class PrefillTarget:
         self._step: _PrefillStep | None = None
         # Whether this rank reported the GDN in-place short-context path yet.
         self._gdn_inplace_reported = False
+        # `_GDN_BREAK_GRAPH`: the in-forward split's vectors at fixed addresses, the row
+        # index a graphed break masks its padded rows with (per `T`), and whether the first
+        # graphed step was reported.
+        self._gdn_graph_store: dict = {}
+        self._gdn_graph_rows: dict = {}
+        self._gdn_graph_reported = False
 
     def _check_step_contract(self, md) -> None:
         """Opt-in first-forward fail-fast (TRTLLM_MODELING_V2_VALIDATE): calling `step_args`
@@ -4083,7 +4117,12 @@ class PrefillTarget:
         core = self.core
         proj = _dense_mm(x, L.in_proj, L.in_proj8, cublas_mm, "in")
         z = torch.split(proj, core.in_proj_split, 1)[1]
-        eager_on_graph(proj, core_out, i, inner=self._gdn_core)
+        if _GDN_BREAK_GRAPH:
+            _engine_eager_on_graph(
+                self._gdn_core, graph_key=self._gdn_graph_key, graph_body=self._gdn_core_graph
+            )(proj, core_out, i)
+        else:
+            eager_on_graph(proj, core_out, i, inner=self._gdn_core)
         return self._gdn_epilogue(core_out, z, L, x.shape[0])
 
     def _gdn_core(self, proj, out, i) -> None:
@@ -4238,7 +4277,102 @@ class PrefillTarget:
             )
         out[:, num_tokens:].zero_()
 
-    def _gdn_inforward(self, mq, a, b, L, i, qsl, si, hi, out, num_tokens) -> None:
+    def _gdn_graph_key(self, proj, out, i):
+        """`_GDN_BREAK_GRAPH`: the key of this layer's break graph on this step, or None to
+        run `_gdn_core`. Only a context-only step qualifies. The body's launches depend on
+        the request count and the in-forward split's shape; the key also names every buffer
+        the graph reads by address, so it never replays against a moved one."""
+        step = self._step
+        if step is None or _INFORWARD_VALIDATE:
+            return None
+        gdn = step.gdn
+        if gdn[1] > 0 or gdn[13] is not None or gdn[8] is None:
+            return None
+        pools = self.core._bound.pools
+        si_all, hi_all, qsl_all, qsl_long = gdn[3], gdn[6], gdn[8], gdn[9]
+        key = (
+            si_all.shape[0],
+            si_all.data_ptr(),
+            hi_all.data_ptr(),
+            qsl_all.data_ptr(),
+            qsl_long.data_ptr(),
+            pools.conv[i].data_ptr(),
+            pools.ssm[i].data_ptr(),
+        )
+        inf = step.inforward
+        if inf is not None:
+            split = inf.split
+            stage_ssm, stage_conv = self.core._bound.cm.inforward_snapshot_stage_views(i)
+            key += (
+                split.k,
+                split.num_tail_tokens,
+                split.cu.data_ptr(),
+                inf.gather.data_ptr(),
+                inf.carried.data_ptr(),
+                inf.live.data_ptr(),
+                split.tail_slots.data_ptr(),
+                inf.stage_idx.data_ptr(),
+                stage_ssm.data_ptr(),
+                stage_conv.data_ptr(),
+            )
+        return key
+
+    def _gdn_core_graph(self, proj, out, i) -> None:
+        """`_GDN_BREAK_GRAPH`: `_gdn_core` of a context-only step over all `T` rows, whose
+        launches depend only on `_gdn_graph_key`. The rows past the last sequence are zeroed
+        on the way in (FlashInfer's chunked prefill lets a NaN / Inf row that shares a chunk
+        with real tokens reach their outputs and final state) and on the way out."""
+        core = self.core
+        L = self._layers[i]
+        step = self._step
+        gdn = step.gdn
+        si_all, hi_all, qsl_all, qsl_long = gdn[3], gdn[6], gdn[8], gdn[9]
+        num_rows = proj.shape[0]
+        rows = self._gdn_graph_rows.get(num_rows)
+        if rows is None:
+            rows = torch.arange(num_rows, dtype=qsl_long.dtype, device=proj.device)
+            self._gdn_graph_rows[num_rows] = rows
+        padded = (rows >= qsl_long[si_all.shape[0]]).unsqueeze(-1)
+        mixed_qkv, _, a, b = torch.split(proj, core.in_proj_split, 1)
+        for cols in (mixed_qkv, a, b):
+            cols.masked_fill_(padded, 0)
+        if step.inforward is not None:
+            self._gdn_inforward(
+                mixed_qkv, a, b, L, i, qsl_all, si_all, hi_all, out, num_rows, graphed=True
+            )
+        else:
+            q, k, v, g, beta = self._gdn_prefill_prep(
+                mixed_qkv, a, b, L, i, qsl_all, si_all, hi_all
+            )
+            flashinfer_chunk_gated_delta_rule(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                scale=None,
+                initial_state=core._bound.pools.ssm[i],
+                initial_state_indices=si_all,
+                inplace_indexed_state_update=True,
+                output_final_state=False,
+                cu_seqlens=qsl_long,
+                head_first=False,
+                use_qk_l2norm_in_kernel=False,
+                output=out[:, :num_rows],
+                state_workspace=None,
+                has_initial_state=hi_all,
+                linear_gate=True,
+            )
+        out[0].masked_fill_(padded.unsqueeze(-1), 0)
+        if not self._gdn_graph_reported:
+            self._gdn_graph_reported = True
+            print(
+                f"modeling_v2 qwen4_exp default target: rank {core.mapping.rank} runs the GDN "
+                "break of context-only steps as a CUDA graph",
+                flush=True,
+            )
+
+    def _gdn_inforward(self, mq, a, b, L, i, qsl, si, hi, out, num_tokens, graphed=False) -> None:
         """The context-only recurrence of a step with in-forward snapshots (`_InforwardSplit`).
 
         The conv pass runs over whole chunks, so it leaves each planned slot the window that
@@ -4253,7 +4387,7 @@ class PrefillTarget:
         stage_ssm, stage_conv = core._bound.cm.inforward_snapshot_stage_views(i)
         ref = (
             self._gdn_inforward_reference(mq, a, b, L, i, qsl, si, hi, num_tokens)
-            if _INFORWARD_VALIDATE
+            if _INFORWARD_VALIDATE and not graphed
             else None
         )
         window = mq.index_select(0, split.conv_win)
@@ -4285,8 +4419,10 @@ class PrefillTarget:
             stage=stage_ssm,
             stage_rows=split.stage_rows,
             stage_idx=inf.stage_idx,
-            tail_lo=split.tail_lo,
-            tail_hi=split.tail_hi,
+            # A graphed break names no row range: the tail is gathered whatever the
+            # number of split requests, so the launches depend on the key alone.
+            tail_lo=-1 if graphed else split.tail_lo,
+            tail_hi=-1 if graphed else split.tail_hi,
             output=out[:, :num_tokens],
         )
         if ref is not None:
@@ -4776,7 +4912,9 @@ class PrefillTarget:
             fp8_pages=fp8_pages,
             nvfp4_context=nvfp4_context,
             live_cols=_live_score_columns(core, md, batch),
-            inforward=_inforward_split(md, mm, si_all, hi_all, pools),
+            inforward=_inforward_split(
+                md, mm, si_all, hi_all, pools, self._gdn_graph_store if _GDN_BREAK_GRAPH else None
+            ),
         )
 
     def forward(
