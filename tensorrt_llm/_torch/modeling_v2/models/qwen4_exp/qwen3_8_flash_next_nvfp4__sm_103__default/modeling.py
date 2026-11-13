@@ -3779,6 +3779,10 @@ _INFORWARD_VALIDATE = os.environ.get("TRTLLM_QWEN4_EXP_INFORWARD_VALIDATE", "0")
 # request count, the in-forward split's shape and the addresses of the metadata and state
 # buffers it reads. The body runs the recurrence over all `T` padded rows. Default off.
 _GDN_BREAK_GRAPH = os.environ.get("TRTLLM_QWEN4_EXP_GDN_BREAK_GRAPH", "0") == "1"
+# The largest prefill bucket whose GDN break replays as a graph. The graph runs the
+# recurrence over all `T` padded rows, which costs GPU time on a step padded far up a large
+# bucket; the host time it saves is what bounds a small step.
+_GDN_BREAK_GRAPH_MAX_TOKENS = int(os.environ.get("TRTLLM_QWEN4_EXP_GDN_BREAK_GRAPH_MAX_TOKENS", "2048"))
 _inforward_validate_reports = 0
 _inforward_validate_warmup = False
 
@@ -4287,6 +4291,8 @@ class PrefillTarget:
             return None
         gdn = step.gdn
         if gdn[1] > 0 or gdn[13] is not None or gdn[8] is None:
+            return None
+        if proj.shape[0] > _GDN_BREAK_GRAPH_MAX_TOKENS:
             return None
         pools = self.core._bound.pools
         si_all, hi_all, qsl_all, qsl_long = gdn[3], gdn[6], gdn[8], gdn[9]
