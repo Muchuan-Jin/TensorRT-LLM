@@ -2916,9 +2916,13 @@ class DecoderInputPreparer:
             supports_mixed_breakable = getattr(
                 layer_model, "disagg_remote_tail_replay", False
             ) and not getattr(layer_model, "disagg_context_only", False)
+            # A warmup request carries a dummy mrope_config, as it did when the bucket graph
+            # was captured: it does not keep the forward that captures the bucket graph's
+            # break graphs from replaying that graph.
+            captures_break_graphs = is_dummy and breakable_runner.is_capturing_break_graphs
             breakable_eligible = (
                 replay_plan is None
-                and not host.lists.multimodal_params_list
+                and (not host.lists.multimodal_params_list or captures_break_graphs)
                 and (
                     not host.remote_tail_modes
                     or (supports_mixed_breakable and host.remote_tail_modes == {"destination"})
