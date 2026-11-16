@@ -739,6 +739,54 @@ def test_prefill_padding_targets_replayable_buckets(state, captured, num_tokens,
         set_per_request_prefill_cuda_graph_flag(False)
 
 
+@pytest.mark.parametrize(
+    "is_dummy, capturing_break_graphs, multimodal, replays",
+    [
+        # The warmup forward that captures the bucket graph's break graphs replays the
+        # graph although its dummy request carries multimodal params (a dummy mrope_config).
+        (True, True, True, True),
+        (True, True, False, True),
+        # Any other warmup forward runs eagerly.
+        (True, False, True, False),
+        (True, False, False, False),
+        # A served batch replays unless it carries multimodal params.
+        (False, False, True, False),
+        (False, False, False, True),
+    ],
+)
+def test_break_graph_capture_replays_with_dummy_multimodal_params(
+    is_dummy, capturing_break_graphs, multimodal, replays
+):
+    runner = SimpleNamespace(
+        is_capturing=False,
+        is_warming_up=False,
+        is_capturing_break_graphs=capturing_break_graphs,
+        captured_num_tokens=[8],
+        has_graph=lambda num_tokens: num_tokens == 8,
+    )
+    preparer = _make_padding_preparer(runner)
+    preparer.model = SimpleNamespace()
+    host = SimpleNamespace(
+        total_num_tokens=5,
+        num_ctx_requests=1,
+        remote_tail_modes=set(),
+        lists=SimpleNamespace(
+            multimodal_params_list=[object()] if multimodal else [], sequence_lengths=[5]
+        ),
+    )
+    scheduled_requests = SimpleNamespace(attention_dp_phase=None, context_requests=[])
+    attn_metadata = SimpleNamespace(padded_num_tokens=None)
+    try:
+        preparer._pad_inputs(
+            host, scheduled_requests, attn_metadata, None, False, is_dummy=is_dummy
+        )
+        assert get_per_request_prefill_cuda_graph_flag() == replays
+        assert host.virtual_num_tokens == (8 if replays else 5)
+        assert attn_metadata.padded_num_tokens == (8 if replays else None)
+    finally:
+        set_per_request_prefill_cuda_graph_flag(False)
+
+
 class _PositionBody(nn.Module):
     """Decoder body stand-in whose output reads the (mrope) position ids."""
 
