@@ -167,9 +167,6 @@ from tensorrt_llm._torch.modeling_v2.catalog.comm.allreduce import allreduce, al
 from tensorrt_llm._torch.modeling_v2.catalog.comm.reducescatter import reducescatter
 from tensorrt_llm._torch.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
 from tensorrt_llm._torch.modeling_v2.catalog.graph.eager_on_graph import eager_on_graph
-from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import (
-    eager_on_graph as _engine_eager_on_graph,
-)
 from tensorrt_llm._torch.modeling_v2.catalog.moe.fp4_block_scale_moe_runner import (
     MAX_CERTIFIED_TOKENS as _MOE_MAX_ROWS,
 )
@@ -426,6 +423,9 @@ from tensorrt_llm._torch.modules.fla.flashinfer_cached_replay import (
     flashinfer_cached_replay_update,
 )
 from tensorrt_llm._torch.modules.logits_processor import LogitsProcessor
+from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import (
+    eager_on_graph as _engine_eager_on_graph,
+)
 from tensorrt_llm._torch.pyexecutor.model_loader import effective_mamba_ssm_cache_dtype
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import RuntimeHooks
 from tensorrt_llm._torch.speculative import get_spec_worker, should_use_separate_draft_kv_cache
@@ -3782,7 +3782,9 @@ _GDN_BREAK_GRAPH = os.environ.get("TRTLLM_QWEN4_EXP_GDN_BREAK_GRAPH", "0") == "1
 # The largest prefill bucket whose GDN break replays as a graph. The graph runs the
 # recurrence over all `T` padded rows, which costs GPU time on a step padded far up a large
 # bucket; the host time it saves is what bounds a small step.
-_GDN_BREAK_GRAPH_MAX_TOKENS = int(os.environ.get("TRTLLM_QWEN4_EXP_GDN_BREAK_GRAPH_MAX_TOKENS", "2048"))
+_GDN_BREAK_GRAPH_MAX_TOKENS = int(
+    os.environ.get("TRTLLM_QWEN4_EXP_GDN_BREAK_GRAPH_MAX_TOKENS", "2048")
+)
 _inforward_validate_reports = 0
 _inforward_validate_warmup = False
 
@@ -3865,7 +3867,9 @@ def _stable(store: dict | None, name: str, value: torch.Tensor) -> torch.Tensor:
     return view
 
 
-def _inforward_split(md, mm, si_all, hi_all, pools, store: dict | None = None) -> _InforwardSplit | None:
+def _inforward_split(
+    md, mm, si_all, hi_all, pools, store: dict | None = None
+) -> _InforwardSplit | None:
     """This step's in-forward snapshot split, or None on a step without one. With `store`
     its per-step vectors live in buffers of fixed address (`_stable`)."""
     split = getattr(mm, "inforward_split", None)
